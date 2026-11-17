@@ -1,12 +1,17 @@
-// A working gta6-01 entry (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. Only the plumbing, not an open world: Block
-// Dodger, a plain 2D canvas game where a paddle dodges falling blocks and catches coins, with a
-// title screen, score, lives and levels, game over and restart, flat colours and no sound. Build
-// your own open-world crime game in its place (three.js or any library you vendor under game/),
-// put your 3 or 4 PNG or JPEG screenshots in screenshots/ (the first by name is the cover) and run it.
+// Palm Reef: Street Heat — a top-down open-world crime game for make.fun's
+// "Make GTA 6" bounty (gta6-01), built by an AI agent. Dario Solano, a courier in
+// debt, runs three jobs for Marla of Marla's Motorworks across the six districts
+// of Palm Reef: steal cars, dodge a five-star wanted level, and bring the orange
+// Serrano GT home. Final art notes: the cover is the four-star chase on the
+// Downtown avenue; the drive scene ends on the Marina coast road with the bay
+// along the bottom of the frame. The game itself is plain static files
+// (game/index.html and its ES modules, no library, no network request) that a
+// desktop browser loads offline. This program is only the hand-in: it copies
+// game/ and screenshots/ from beside this file to /output and writes
+// /output/dossier.json, the summary the judge reads, with the vendored make.fun
+// library. Node 22, standard library only; the program runs twice and writes
+// identical bytes (no timestamps, no randomness here — the live game's seed
+// lives in the browser, not in this file).
 //
 // Serve it locally with `node serve.ts`, then open http://localhost:8080.
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
