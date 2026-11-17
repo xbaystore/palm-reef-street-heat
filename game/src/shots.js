@@ -1,79 +1,184 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The four deterministic screenshot scenes behind ?shot=chase|onfoot|drive|mission
+// (with &seed=N). Each one arranges the real world — the real cars, the real
+// wanted level, the real story stage — and runs the real step for a second or
+// two, so the frame is what a short game really looks like and the same seed
+// always gives the same frame. main.js paints twice and sets window.__shotReady.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { STEP } from './config.js';
+import { LANDMARKS } from './city.js';
+import { createCar } from './vehicles.js';
+import { stepWorld } from './world.js';
+import { IDLE_INPUT } from './input.js';
+import { loopPoint } from './pedestrians.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function throttleInput() {
+  return { up: true, down: false, left: false, right: false, run: false, punch: false, enter: false };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function runSteps(world, input, seconds) {
+  const steps = Math.round(seconds / STEP);
+  for (let i = 0; i < steps; i += 1) stepWorld(world, input, STEP);
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function addTrafficCar(world, x, y, angle, dir, horizontal, speed) {
+  const car = createCar('sedan', x, y, angle, '#4f7ec9');
+  car.speed = speed;
+  world.traffic.push({ car, horizontal, dir, speed, targetSpeed: speed });
+  return car;
+}
+
+function stageChase(world) {
+  // Player in the Serrano, eastbound at 235 on the Downtown avenue (road y=480).
+  const serrano = world.serrano;
+  serrano.x = 1560;
+  serrano.y = 506;
+  serrano.angle = 0;
+  serrano.speed = 235;
+  serrano.health = serrano.maxHealth;
+  serrano.owned = true;
+  const p = world.player;
+  p.car = serrano;
+  p.x = serrano.x;
+  p.y = serrano.y;
+  p.angle = 0;
+  // Three cruisers: two behind on the avenue, one coming up the cross road.
+  world.police = [];
+  const c1 = createCar('police', 1330, 506, 0, '#1c1e26');
+  c1.speed = 300;
+  const c2 = createCar('police', 1240, 454, Math.PI, '#1c1e26');
+  c2.speed = 280;
+  const c3 = createCar('police', 1920, 712, -Math.PI / 2, '#1c1e26');
+  c3.speed = 300;
+  world.police.push(c1, c2, c3);
+  // Four stars of heat.
+  world.wanted.heat = 390;
+  world.wanted.stars = 4;
+  world.wanted.lastSeen = world.time;
+  // Story: Mission 2, "Deliver the Serrano GT".
+  world.story.active = true;
+  world.story.mission = 1;
+  world.story.stage = 2;
+  world.story.timerLeft = 0;
+  // Traffic both ways on the avenue.
+  addTrafficCar(world, 1000, 506, 0, 1, true, 150);
+  addTrafficCar(world, 2200, 506, 0, 1, true, 160);
+  addTrafficCar(world, 1800, 454, Math.PI, -1, true, 150);
+  addTrafficCar(world, 900, 454, Math.PI, -1, true, 140);
+  runSteps(world, throttleInput(), 1.3);
+  // The chase may have added crimes mid-run; the frame is four stars, so pin
+  // the heat back to 390 and keep the four closest cruisers.
+  world.wanted.heat = 390;
+  world.wanted.stars = 4;
+  world.wanted.lastSeen = world.time;
+  while (world.police.length > 4) {
+    let far = 0;
+    let farD = -1;
+    for (let i = 0; i < world.police.length; i += 1) {
+      const d = Math.hypot(world.police[i].x - world.player.x, world.police[i].y - world.player.y);
+      if (d > farD) {
+        farD = d;
+        far = i;
+      }
+    }
+    world.police.splice(far, 1);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+function stageOnFoot(world) {
+  // Dario on foot, facing a parked taxi — the [E] Enter the Taxi prompt shows.
+  const p = world.player;
+  p.car = null;
+  p.x = 2070;
+  p.y = 912;
+  p.angle = Math.atan2(950 - 912, 2105 - 2070);
+  p.vx = 0;
+  p.vy = 0;
+  const taxi = createCar('taxi', 2105, 950, 0, '#f2c94c');
+  world.parked.push(taxi);
+  world.parked.push(createCar('sedan', 1995, 954, 0, '#c94f43'));
+  world.parked.push(createCar('sedan', 2235, 954, 0, '#4f7ec9'));
+  // Ten pedestrians retargeted to block (4,1)'s sidewalk loop, around the player.
+  const block = world.city.blocks.find((b) => b.col === 4 && b.row === 1);
+  const loop = { x: block.rect.x - 12, y: block.rect.y - 12, w: block.rect.w + 24, h: block.rect.h + 24 };
+  for (let i = 0; i < 10 && i < world.pedestrians.length; i += 1) {
+    const ped = world.pedestrians[i];
+    ped.block = { col: 4, row: 1 };
+    ped.t = i * 156;
+    ped.state = 'walk';
+    ped.downTimer = 0;
+    const at = loopPoint(loop, ped.t);
+    ped.x = at.x;
+    ped.y = at.y;
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+  // Traffic passing on road y=960.
+  addTrafficCar(world, 1500, 986, 0, 1, true, 150);
+  addTrafficCar(world, 2400, 934, Math.PI, -1, true, 150);
+  // Fresh story: the banner says "See Marla at her Motorworks".
+  world.story.active = false;
+  world.story.mission = 0;
+  world.story.stage = 0;
+  runSteps(world, IDLE_INPUT, 0.9);
+}
+
+function stageDrive(world) {
+  // Dario in a teal coupe, southbound on the coast road (x=2400) at 250, a
+  // cruiser behind, the bay at the bottom of the frame after the run.
+  const coupe = createCar('coupe', 2374, 2150, Math.PI / 2, '#2fb3a8');
+  coupe.speed = 250;
+  coupe.owned = true;
+  const p = world.player;
+  p.car = coupe;
+  p.x = coupe.x;
+  p.y = coupe.y;
+  p.angle = Math.PI / 2;
+  world.police = [];
+  const cruiser = createCar('police', 2374, 1900, Math.PI / 2, '#1c1e26');
+  cruiser.speed = 250;
+  world.police.push(cruiser);
+  world.wanted.heat = 90;
+  world.wanted.stars = 1;
+  world.wanted.lastSeen = world.time;
+  // Traffic ahead (southbound) and northbound on the other lane.
+  addTrafficCar(world, 2374, 2650, Math.PI / 2, 1, false, 150);
+  addTrafficCar(world, 2426, 2300, -Math.PI / 2, -1, false, 150);
+  addTrafficCar(world, 2426, 2600, -Math.PI / 2, -1, false, 140);
+  runSteps(world, throttleInput(), 1.3);
+  // Pin the frame to one star even if the cruiser clipped the coupe mid-run.
+  world.wanted.heat = 90;
+  world.wanted.stars = 1;
+  world.wanted.lastSeen = world.time;
+}
+
+function stageMission(world) {
+  // Dario in a white van beside the Marina drop; Mission 1 stage 2 with 204 s
+  // left on the clock (banner: 3:24, 28 m); a contact stands at the marker.
+  const van = createCar('van', 1894, 2690, Math.PI / 2, '#e8e8e8');
+  van.speed = 0;
+  van.owned = true;
+  const p = world.player;
+  p.car = van;
+  p.x = van.x;
+  p.y = van.y;
+  p.angle = Math.PI / 2;
+  world.story.active = true;
+  world.story.mission = 0;
+  world.story.stage = 1;
+  world.story.timerLeft = 204;
+  // A contact pedestrian standing at the marker.
+  const contact = world.pedestrians[0];
+  contact.state = 'stand';
+  contact.x = 2196;
+  contact.y = 2762;
+  runSteps(world, IDLE_INPUT, 0.7);
+}
+
+/** Set `world` to the named scene (chase, onfoot, drive or mission; any other name is chase). */
+export function stageShot(world, name) {
+  world.state = 'play';
+  if (name === 'onfoot') stageOnFoot(world);
+  else if (name === 'drive') stageDrive(world);
+  else if (name === 'mission') stageMission(world);
+  else stageChase(world);
+  world.events.length = 0;
+  return world;
 }

@@ -1,18 +1,23 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Boot and the one loop: input is read every frame, the world advances in fixed
+// 1/60 s steps, and the renderer paints what is there. The game moves between
+// title, play, paused, busted and wasted; events from the world drive sounds,
+// toasts and autosaves. ?seed=N fixes the city; ?shot=chase|onfoot|drive|mission
+// stages that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+
+import { STEP, VIEW } from './config.js';
+import { createWorld, stepWorld } from './world.js';
+import { createInput, ACTION_CONFIRM, ACTION_CONTINUE, ACTION_PAUSE, IDLE_INPUT } from './input.js';
+import { createRenderer, createCamera, centerCamera } from './render.js';
+import { createToasts, drawHud, drawTitle, drawPaused, drawBusted, drawWasted } from './hud.js';
+import { currentObjective } from './missions.js';
+import { carInReach } from './player.js';
+import { loadRun, saveRun, applyRun, clearRun } from './savegame.js';
+import { createAudio } from './audio.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+const AUTOSAVE_EVERY = 5;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
@@ -21,85 +26,179 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+const camera = createCamera();
+const toasts = createToasts();
+const audio = createAudio();
+const input = createInput();
+input.attach();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+let world = createWorld(seed);
+let screen = 'title';
+
+function announce(message) {
+  status.textContent = message;
+}
+
+function kindLabel(kind) {
+  return kind.charAt(0).toUpperCase() + kind.slice(1);
+}
+
+function currentPrompt() {
+  if (screen !== 'play') return null;
+  const p = world.player;
+  if (p.car) return '[E] Get out';
+  const car = carInReach(world);
+  if (!car) return null;
+  if (car === world.serrano && !car.owned) return '[E] STEAL the Serrano GT';
+  return `[E] Enter the ${kindLabel(car.kind)}`;
+}
+
+function handleEvents() {
+  for (const event of world.events) {
+    if (event.type === 'punch') audio.punch();
+    else if (event.type === 'crash') audio.crash();
+    else if (event.type === 'hurt') audio.hurt();
+    else if (event.type === 'cash') {
+      audio.cash();
+      toasts.push(`Job complete: ${event.title} — +$${event.amount}`);
+      saveRun(window.localStorage, world);
+    } else if (event.type === 'newJob') {
+      audio.news();
+      toasts.push(`New job: ${event.title}`);
+    } else if (event.type === 'stage') {
+      toasts.push(event.text);
+    } else if (event.type === 'jobFailed') {
+      audio.news();
+      toasts.push(event.reason);
+    } else if (event.type === 'steal') {
+      audio.news();
+      toasts.push(`Stole the ${kindLabel(event.kind)} — the law noticed`);
+    } else if (event.type === 'enterCar') audio.news();
+    else if (event.type === 'pedDown') toasts.push('Pedestrian down — witnesses will talk');
+    else if (event.type === 'storyDone') {
+      audio.cash();
+      toasts.push('All three jobs done. Palm Reef is yours.');
+    }
+  }
+  if (world.state === 'busted') {
+    screen = 'busted';
+    audio.hurt();
+    saveRun(window.localStorage, world);
+    announce(`Busted. Cash left $${world.player.money}.`);
+  } else if (world.state === 'wasted') {
+    screen = 'wasted';
+    audio.hurt();
+    saveRun(window.localStorage, world);
+    announce(`Wasted. Cash left $${world.player.money}.`);
+  }
+  world.events.length = 0;
+}
+
+function paint() {
+  world._objective = currentObjective(world);
+  centerCamera(camera, world.player.x, world.player.y);
+  renderer.drawWorld(world, camera);
+  if (screen === 'title') drawTitle(renderer.ctx, loadRun(window.localStorage) !== null);
+  else if (screen === 'play') drawHud(renderer.ctx, world, toasts, currentPrompt());
+  else if (screen === 'paused') {
+    drawHud(renderer.ctx, world, toasts, null);
+    drawPaused(renderer.ctx);
+  } else if (screen === 'busted') {
+    drawHud(renderer.ctx, world, toasts, null);
+    drawBusted(renderer.ctx, world.player.money);
+  } else if (screen === 'wasted') {
+    drawHud(renderer.ctx, world, toasts, null);
+    drawWasted(renderer.ctx, world.player.money);
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+function startFresh() {
+  world = createWorld(seed);
+  toasts.list.length = 0;
+  clearRun(window.localStorage);
+  world.state = 'play';
+  screen = 'play';
+  announce('Playing. See Marla at her Motorworks.');
+}
+
+function continueRun() {
+  const data = loadRun(window.localStorage);
+  if (!data) return;
+  world = createWorld(seed);
+  applyRun(world, data);
+  toasts.list.length = 0;
+  world.state = 'play';
+  screen = 'play';
+  announce('Continuing your run.');
+}
+
+function resumeFromOutcome() {
+  world.state = 'play';
+  screen = 'play';
+  announce('Back on the streets.');
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world);
+  stageShot(world, name);
+  screen = 'play';
   let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+  function paintOnce() {
+    paint();
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
+    if (painted < 2) requestAnimationFrame(paintOnce);
     else window.__shotReady = true;
   }
-  requestAnimationFrame(paint);
+  requestAnimationFrame(paintOnce);
 }
 
 function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
+    if (actions & ACTION_CONFIRM) {
+      if (screen === 'title') startFresh();
+      else if (screen === 'busted' || screen === 'wasted') resumeFromOutcome();
+      else if (screen === 'paused') {
+        screen = 'play';
+        announce('Playing.');
+      }
+    }
+    if (actions & ACTION_CONTINUE && screen === 'title') continueRun();
+    if (actions & ACTION_PAUSE) {
+      if (screen === 'play') {
+        screen = 'paused';
+        announce('Paused.');
+      } else if (screen === 'paused') {
+        screen = 'play';
+        announce('Playing.');
+      }
     }
   }
 
   function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
+    const stepInput = screen === 'play' ? input.read() : IDLE_INPUT;
+    if (screen === 'play') {
+      audio.ensure();
+      stepWorld(world, stepInput, STEP);
+      toasts.step(STEP);
+      world.autosaveTimer += STEP;
+      if (world.autosaveTimer >= AUTOSAVE_EVERY) {
+        world.autosaveTimer = 0;
+        saveRun(window.localStorage, world);
+      }
+      // Engine hum follows speed; the siren sounds while a cruiser is close.
+      const p = world.player;
+      audio.engine(p.car ? Math.abs(p.car.speed) / p.car.top : 0);
+      const near = world.police.some((pc) => Math.hypot(pc.x - p.x, pc.y - p.y) < 600);
+      audio.siren(near);
+      handleEvents();
+    } else {
+      // Title backdrop: the city idles behind the panel.
+      input.read();
     }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
   }
 
   function frame(now) {
@@ -107,26 +206,25 @@ function runGame() {
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
     handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
+    if (screen === 'title' || screen === 'play') {
+      while (accumulator >= STEP && (screen === 'title' || screen === 'play')) {
         step();
         accumulator -= STEP;
       }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    paint();
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (document.hidden && screen === 'play') {
+      screen = 'paused';
       announce('Paused.');
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce('Palm Reef: Street Heat. Press Enter to play.');
   requestAnimationFrame(frame);
 }
 
